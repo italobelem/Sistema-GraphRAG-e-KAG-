@@ -1,0 +1,84 @@
+import os
+import json
+
+DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../data"))
+
+RELATORIOS_CTI = [
+    {
+        "id": "DOC-CTI-001",
+        "titulo": "Boletim de Ameaça: Operações do Cozy Bear em Cadeias de Suprimentos",
+        "data_publicacao": "2026-01-15",
+        "texto_bruto": (
+            "Relatórios recentes de inteligência apontam que o grupo de ameaça avançada conhecido como Cozy Bear "
+            "(também rastreado pela indústria como APT29) conduziu campanhas altamente furtivas. Durante a intrusão, "
+            "o Cozy Bear utilizou o malware backdoor SUNBURST para manter persistência de longo prazo. Além disso, "
+            "observou-se que o APT29 utiliza a técnica de Phishing Spearphishing Attachment (MITRE ID: T1566) para "
+            "comprometer estações de trabalho iniciais."
+        )
+    },
+    {
+        "id": "DOC-CTI-002",
+        "titulo": "Análise Técnica de Artefato: Backdoor SUNBURST e Exploração de Zero-Days",
+        "data_publicacao": "2026-02-03",
+        "texto_bruto": (
+            "A análise reversa do malware SUNBURST revelou que o artefato implanta a técnica de Valid Accounts "
+            "(MITRE ID: T1078) para movimentação lateral silenciosa. Para escalar privilégios na rede interna, "
+            "o malware SUNBURST explora diretamente a vulnerabilidade crítica CVE-2020-10189 (CVSS 9.8), permitindo "
+            "execução remota de código sem autenticação prévia nos servidores corporativos."
+        )
+    },
+    {
+        "id": "DOC-CTI-003",
+        "titulo": "Alerta CISA: Impacto da CVE-2020-10189 em Infraestruturas Críticas",
+        "data_publicacao": "2026-02-20",
+        "texto_bruto": (
+            "A vulnerabilidade CVE-2020-10189 possui severidade CVSS 9.8 e afeta diretamente o sistema de gerência "
+            "Zoho ManageEngine, amplamente implantado no Setor de Energia Elétrica e em Redes Governamentais. "
+            "Adicionalmente, um novo relatório da Microsoft identificou que o ator Midnight Blizzard (novo codinome "
+            "para o grupo APT29) continua buscando alvos no Setor Diplomático Europeu usando a técnica T1078."
+        )
+    },
+    {
+        "id": "DOC-CTI-004",
+        "titulo": "Rastreamento Financeiro: Campanhas do HIDDEN COBRA contra Bancos",
+        "data_publicacao": "2026-03-10",
+        "texto_bruto": (
+            "O grupo norte-coreano HIDDEN COBRA, amplamente conhecido como Lazarus Group, intensificou ataques "
+            "contra o Setor Financeiro e Corretoras de Criptoativos na América Latina. O Lazarus Group utiliza o "
+            "malware trojan AppleJeus e implanta a técnica Command and Scripting Interpreter (MITRE ID: T1059) "
+            "para executar payloads maliciosos em memória."
+        )
+    },
+    {
+        "id": "DOC-CTI-005",
+        "titulo": "Relatório de Vulnerabilidade CVE-2023-38831 e Conexões com AppleJeus",
+        "data_publicacao": "2026-03-28",
+        "texto_bruto": (
+            "Pesquisadores descobriram que as variantes recentes do malware AppleJeus exploram a vulnerabilidade "
+            "CVE-2023-38831 (severidade CVSS 7.8) presente no software WinRAR. Essa falha CVE-2023-38831 afeta "
+            "diretamente Corretoras de Criptoativos e Bancos Comerciais. Curiosamente, a mesma vulnerabilidade "
+            "CVE-2023-38831 também passou a ser explorada pelo grupo russo Fancy Bear (APT28)."
+        )
+    },
+    {
+        "id": "DOC-CTI-006",
+        "titulo": "Táticas Convergentes: APT28 e Abuso de Credenciais",
+        "data_publicacao": "2026-04-05",
+        "texto_bruto": (
+            "O grupo APT28 ( historicamente chamado de Fancy Bear ou Strontium ) lançou operações contra o "
+            "Setor Aeroespacial e de Defesa. Para contornar controles de perímetro, o Fancy Bear utiliza o malware "
+            "X-Agent e também abusa da técnica Valid Accounts (MITRE ID: T1078) e exploração da falha CVE-2023-23397 "
+            "(CVSS 9.8), que afeta o Microsoft Outlook no Setor de Energia Elétrica."
+        )
+    }
+]
+
+def gerar_dataset():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    caminho_arquivo = os.path.join(DATA_DIR, "cti_reports.json")
+    with open(caminho_arquivo, "w", encoding="utf-8") as f:
+        json.dump(RELATORIOS_CTI, f, ensure_ascii=False, indent=2)
+    print(f"[OK] Dataset gerado com {len(RELATORIOS_CTI)} relatórios em: {caminho_arquivo}")
+
+if __name__ == "__main__":
+    gerar_dataset()
