@@ -1,7 +1,8 @@
-neo4j==5.25.0
-python-dotenv==1.0.1
-pydantic==2.9.2
-google-genai==0.3.0
-streamlit==1.39.0
-pyvis==0.3.2
-pytest==8.3.3
+neo4j>=5.23.0
+google-genai>=1.0.0
+pydantic>=2.8.0
+python-dotenv>=1.0.1
+streamlit>=1.38.0
+pyvis>=0.3.2
+pytest>=8.3.0
+pypdf>=4.3.0

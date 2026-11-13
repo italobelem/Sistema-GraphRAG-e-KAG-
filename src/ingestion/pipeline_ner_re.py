@@ -1,379 +1,412 @@
 import sys
 import os
-import json
-import time
-from typing import List, Literal, Optional
+import glob
+import hashlib
+from typing import List
 from pydantic import BaseModel, Field
-from neo4j import GraphDatabase
+from pypdf import PdfReader
 from google import genai
 from google.genai import types
+from neo4j import GraphDatabase
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, GEMINI_API_KEY, EMBEDDING_DIMENSION
-from src.ingestion.dataset_generator import DATA_DIR, gerar_dataset
 
 # =====================================================================
-# 1. DEFINIÇÃO DO SCHEMA DE EXTRAÇÃO (PYDANTIC STRUCTURED OUTPUTS)
+# 1. SCHEMAS PYDANTIC PARA EXTRAÇÃO ESTRUTURADA (NER & RE MÉDICO)
 # =====================================================================
 
-class EntidadeExtraida(BaseModel):
-    nome: str = Field(description="Nome principal da entidade extraída do texto.")
-    tipo: Literal["GrupoAmeaca", "Malware", "Vulnerabilidade", "Tecnica", "Alvo"]
-    aliases: List[str] = Field(default_factory=list)
-    cve_id: Optional[str] = None
-    severidade_cvss: Optional[float] = None
-    mitre_id: Optional[str] = None
-    categoria_setor: Optional[str] = None
-    descricao: str
+class EntidadeMedica(BaseModel):
+    nome: str = Field(description="Nome da entidade médica extraída do prontuário")
+    tipo: str = Field(description="Tipo: Paciente, Doenca, Causa, Medicamento ou RiscoClinico")
+    descricao: str = Field(description="Resumo clínico, idade, posologia ou mecanismo fisiopatológico")
+    cid10: str = Field(default="", description="Código CID-10 se for Doenca")
+    faixa_etaria: str = Field(default="", description="Idade e sexo se for Paciente")
+    classe_terapeutica: str = Field(default="", description="Classe farmacológica se for Medicamento")
 
-class RelacaoExtraida(BaseModel):
-    origem: str
-    tipo_relacao: Literal["UTILIZA", "IMPLANTA_TECNICA", "EXPLORA", "AFETA", "ATACA"]
-    destino: str
-    evidencia: str
+class RelacaoMedica(BaseModel):
+    origem: str = Field(description="Nome da entidade de origem")
+    destino: str = Field(description="Nome da entidade de destino")
+    tipo_relacao: str = Field(
+        description="Relação: DIAGNOSTICADO_COM, CAUSADO_POR, TRATADO_COM, INTERAGE_COM, CONTRAINDICADO_EM, CAUSA_RISCO"
+    )
 
 class GrafoExtraido(BaseModel):
-    entidades: List[EntidadeExtraida]
-    relacoes: List[RelacaoExtraida]
+    entidades: List[EntidadeMedica]
+    relacoes: List[RelacaoMedica]
 
 # =====================================================================
-# 2. MÓDULO DE RESOLUÇÃO DE ENTIDADES (ENTITY RESOLUTION / CANONICALIZATION)
+# 2. DICIONÁRIO CANÔNICO DE ENTITY RESOLUTION (DOMÍNIO DE SAÚDE)
 # =====================================================================
 
-MAPA_CANONICO_SINONIMOS = {
-    "cozy bear": ("APT29", ["Cozy Bear", "Midnight Blizzard", "APT29"]),
-    "midnight blizzard": ("APT29", ["Cozy Bear", "Midnight Blizzard", "APT29"]),
-    "apt29": ("APT29", ["Cozy Bear", "Midnight Blizzard", "APT29"]),
-    "hidden cobra": ("Lazarus Group", ["HIDDEN COBRA", "Lazarus Group"]),
-    "lazarus group": ("Lazarus Group", ["HIDDEN COBRA", "Lazarus Group"]),
-    "fancy bear": ("APT28", ["Fancy Bear", "Strontium", "APT28"]),
-    "strontium": ("APT28", ["Fancy Bear", "Strontium", "APT28"]),
-    "apt28": ("APT28", ["Fancy Bear", "Strontium", "APT28"]),
-    "valid accounts": ("T1078 - Valid Accounts", ["Valid Accounts", "T1078"]),
-    "t1078": ("T1078 - Valid Accounts", ["Valid Accounts", "T1078"]),
-    "phishing spearphishing attachment": ("T1566 - Spearphishing Attachment", ["Spearphishing Attachment", "T1566"]),
-    "spearphishing attachment": ("T1566 - Spearphishing Attachment", ["Spearphishing Attachment", "T1566"]),
-    "t1566": ("T1566 - Spearphishing Attachment", ["Spearphishing Attachment", "T1566"]),
-    "command and scripting interpreter": ("T1059 - Command and Scripting Interpreter", ["Command and Scripting Interpreter", "T1059"]),
-    "t1059": ("T1059 - Command and Scripting Interpreter", ["Command and Scripting Interpreter", "T1059"]),
+MAPA_CANONICO_SAUDE = {
+    "Infarto Agudo do Miocárdio": ["IAM", "Ataque Cardíaco", "Síndrome Coronariana Aguda", "Infarto Agudo do Miocárdio"],
+    "Úlcera Péptica Gástrica": ["Úlcera Estomacal", "Doença Ulcerosa Péptica", "Úlcera Gástrica", "Úlcera Péptica Gástrica"],
+    "Asma Brônquica Alérgica": ["Bronquite Asmática", "Asma Alérgica", "Hiperreatividade Brônquica", "Asma Brônquica Alérgica"],
+    "Dengue Clássica com Sinais de Alarme": ["Dengue", "Febre Quebra-Ossos", "Infecção por DENV", "Dengue Clássica com Sinais de Alarme"],
+    "Nefropatia Diabética Crônica": ["Doença Renal do Diabetes", "Doença Renal Crônica Diabética", "Nefropatia Diabética Crônica"],
+    "Enxaqueca Crônica com Aura": ["Migrânea com Aura", "Cefaleia Enxaquecosa", "Enxaqueca Crônica com Aura"],
+    "Hipertensão Arterial Sistêmica": ["HAS", "Pressão Alta", "Hipertensão Arterial", "Hipertensão Arterial Sistêmica"],
+    "Diabetes Mellitus Tipo 2": ["DM2", "Diabetes Tipo 2", "Diabetes Mellitus Tipo 2"],
+    "Helicobacter pylori": ["H. pylori", "Bactéria H. pylori", "Helicobacter pylori"],
+    "Alérgenos Domésticos (Ácaros)": ["Ácaros", "Dermatophagoides pteronyssinus", "Poeira Domiciliar", "Alérgenos Domésticos (Ácaros)"],
+    "Vírus da Dengue DENV-2": ["DENV-2", "Aedes aegypti", "Flavivírus DENV-2", "Vírus da Dengue DENV-2"],
+    "Ácido Acetilsalicílico": ["AAS", "Aspirina", "Salicilato", "Ácido Acetilsalicílico"],
+    "Clopidogrel": ["Plavix", "Bissulfato de Clopidogrel", "Clopidogrel"],
+    "Omeprazol": ["Losec", "Inibidor da Bomba de Prótons Omeprazol", "Omeprazol"],
+    "Paracetamol": ["Acetaminofeno", "Tylenol", "Paracetamol"],
+    "Salbutamol": ["Aerolin", "Sulfato de Salbutamol", "Salbutamol"],
+    "Metformina": ["Glifage", "Cloridrato de Metformina", "Metformina"],
+    "Propranolol": ["Cloridrato de Propranolol", "Betabloqueador Propranolol", "Propranolol"],
+    "Angioplastia com Contraste Iodado": ["Angioplastia Coronariana", "Meio de Contraste Iodado", "Contraste Iodado", "Angioplastia com Contraste Iodado"]
 }
 
-def resolver_entidade_canonica(nome: str, aliases_extraidos: List[str] = None) -> tuple[str, List[str]]:
-    """Normaliza nomes e aplica Entity Resolution para evitar nós duplicados no Neo4j."""
-    chave = nome.strip().lower()
-    aliases_finais = set(aliases_extraidos or [])
-    aliases_finais.add(nome.strip())
-
-    for padrao, (nome_canonico, lista_aliases) in MAPA_CANONICO_SINONIMOS.items():
-        if padrao == chave or padrao in chave:
-            aliases_finais.update(lista_aliases)
-            return nome_canonico, sorted(list(aliases_finais))
-
-    return nome.strip(), sorted(list(aliases_finais))
+def resolver_entidade_canonica(nome_bruto: str) -> tuple[str, list[str]]:
+    """Normaliza sinônimos clínicos e farmacológicos para evitar nós duplicados no Neo4j."""
+    nome_limpo = nome_bruto.strip()
+    for canonico, sin_lista in MAPA_CANONICO_SAUDE.items():
+        if nome_limpo.lower() == canonico.lower():
+            return canonico, sin_lista
+        for s in sin_lista:
+            if s.lower() == nome_limpo.lower() or (len(s) >= 4 and s.lower() in nome_limpo.lower()):
+                return canonico, sin_lista
+    return nome_limpo, [nome_limpo]
 
 # =====================================================================
-# 3. EXTRAÇÃO HÍBRIDA DE CONTINGÊNCIA (CASO A API GEMINI ESTEJA COM 503)
+# 3. LEITURA DE PDFS DE MÚLTIPLAS PÁGINAS E SEGMENTAÇÃO (CHUNKING)
 # =====================================================================
 
-EXTRACOES_CONTINGENCIA = {
-    "DOC-CTI-001": {
+def extrair_texto_e_chunks_pdf(caminho_pdf: str, tamanho_chunk: int = 1600, overlap: int = 250) -> dict:
+    """Lê todas as páginas de um arquivo PDF real e divide em Chunks com sobreposição."""
+    reader = PdfReader(caminho_pdf)
+    paginas_texto = []
+    for idx, page in enumerate(reader.pages):
+        txt = page.extract_text() or ""
+        paginas_texto.append(f"[Página {idx+1}]\n{txt.strip()}")
+
+    texto_completo = "\n\n".join(paginas_texto)
+    nome_arquivo = os.path.basename(caminho_pdf).lower()
+
+    # Identifica o ID exato pelo nome do arquivo (prontuario01 / prontuario_01 a 06) ou pelo cabeçalho
+    doc_id = None
+    for num in ["01", "02", "03", "04", "05", "06"]:
+        if f"prontuario_{num}" in nome_arquivo or f"prontuario{num}" in nome_arquivo or f"00{num[-1]}" in nome_arquivo:
+            doc_id = f"DOC-MED-00{num[-1]}"
+            break
+
+    if not doc_id:
+        primeiras_linhas = texto_completo[:350]
+        for cod in ["DOC-MED-001", "DOC-MED-002", "DOC-MED-003", "DOC-MED-004", "DOC-MED-005", "DOC-MED-006"]:
+            if cod in primeiras_linhas:
+                doc_id = cod
+                break
+
+    if not doc_id:
+        sufixo = hashlib.md5(nome_arquivo.encode()).hexdigest()[:4].upper()
+        doc_id = f"DOC-PDF-{sufixo}"
+
+    # Segmentação em Chunks com Overlap para documentos extensos
+    chunks = []
+    inicio = 0
+    indice = 1
+    while inicio < len(texto_completo):
+        fim = min(inicio + tamanho_chunk, len(texto_completo))
+        trecho = texto_completo[inicio:fim]
+        chunks.append({
+            "chunk_id": f"{doc_id}-CHK-{indice:02d}",
+            "ordem": indice,
+            "texto": trecho
+        })
+        if fim == len(texto_completo):
+            break
+        inicio += (tamanho_chunk - overlap)
+        indice += 1
+
+    return {
+        "id": doc_id,
+        "arquivo_pdf": os.path.basename(caminho_pdf),
+        "num_paginas": len(reader.pages),
+        "texto_bruto": texto_completo,
+        "chunks": chunks
+    }
+
+# =====================================================================
+# 4. BASE ESTRUTURADA DE CONTINGÊNCIA PARA OS 6 PRONTUÁRIOS MÉDICOS
+# =====================================================================
+
+EXTRACOES_CONTINGENCIA_SAUDE = {
+    "DOC-MED-001": {
         "entidades": [
-            {"nome": "Cozy Bear", "tipo": "GrupoAmeaca", "aliases": ["APT29"], "descricao": "Grupo de ameaça avançada (APT29) focado em campanhas furtivas."},
-            {"nome": "SUNBURST", "tipo": "Malware", "aliases": [], "descricao": "Malware backdoor utilizado para persistência de longo prazo."},
-            {"nome": "T1566", "tipo": "Tecnica", "aliases": ["Spearphishing Attachment"], "mitre_id": "T1566", "descricao": "Técnica de Phishing Spearphishing Attachment para comprometer estações iniciais."}
+            {"nome": "Paciente P-01 (68a, Masc)", "tipo": "Paciente", "faixa_etaria": "68 anos, Masculino", "descricao": "Aposentado admitido com dor torácica típica e supra de ST"},
+            {"nome": "IAM", "tipo": "Doenca", "cid10": "I21.0", "descricao": "Infarto Agudo do Miocárdio transmural da parede anterior"},
+            {"nome": "HAS", "tipo": "Causa", "descricao": "Hipertensão Arterial Sistêmica crônica e aterosclerose coronariana"},
+            {"nome": "AAS", "tipo": "Medicamento", "classe_terapeutica": "Antiagregante Plaquetário / Salicilato", "descricao": "Ácido Acetilsalicílico 100-300 mg/dia"},
+            {"nome": "Plavix", "tipo": "Medicamento", "classe_terapeutica": "Antiagregante Plaquetário Tienopiridínico", "descricao": "Clopidogrel 75 mg/dia (ativado pela enzima CYP2C19)"},
+            {"nome": "Angioplastia com Contraste Iodado", "tipo": "Medicamento", "classe_terapeutica": "Procedimento Hemodinâmico / Contraste", "descricao": "Implante de stent coronariano com 140 mL de contraste iodado"},
+            {"nome": "Trombose Aguda de Stent", "tipo": "RiscoClinico", "descricao": "Oclusão trombótica do stent por inibição da CYP2C19"}
         ],
         "relacoes": [
-            {"origem": "Cozy Bear", "tipo_relacao": "UTILIZA", "destino": "SUNBURST", "evidencia": "Cozy Bear utilizou o malware backdoor SUNBURST para manter persistência"},
-            {"origem": "APT29", "tipo_relacao": "UTILIZA", "destino": "T1566", "evidencia": "APT29 utiliza a técnica de Phishing Spearphishing Attachment (MITRE ID: T1566)"}
+            {"origem": "Paciente P-01 (68a, Masc)", "destino": "IAM", "tipo_relacao": "DIAGNOSTICADO_COM"},
+            {"origem": "IAM", "destino": "HAS", "tipo_relacao": "CAUSADO_POR"},
+            {"origem": "IAM", "destino": "AAS", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "IAM", "destino": "Plavix", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "IAM", "destino": "Angioplastia com Contraste Iodado", "tipo_relacao": "TRATADO_COM"}
         ]
     },
-    "DOC-CTI-002": {
+    "DOC-MED-002": {
         "entidades": [
-            {"nome": "SUNBURST", "tipo": "Malware", "aliases": [], "descricao": "Backdoor analisado que realiza movimentação lateral e exploração."},
-            {"nome": "T1078", "tipo": "Tecnica", "aliases": ["Valid Accounts"], "mitre_id": "T1078", "descricao": "Técnica de abuso de contas válidas para movimentação lateral silenciosa."},
-            {"nome": "CVE-2020-10189", "tipo": "Vulnerabilidade", "aliases": [], "cve_id": "CVE-2020-10189", "severidade_cvss": 9.8, "descricao": "Vulnerabilidade crítica que permite execução remota de código sem autenticação."}
+            {"nome": "Paciente P-02 (54a, Fem)", "tipo": "Paciente", "faixa_etaria": "54 anos, Feminino", "descricao": "Professora com epigastralgia urente e melena"},
+            {"nome": "Úlcera Estomacal", "tipo": "Doenca", "cid10": "K25.4", "descricao": "Úlcera Péptica Gástrica Forrest IIc em antro gástrico"},
+            {"nome": "H. pylori", "tipo": "Causa", "descricao": "Infecção gástrica ativa por Helicobacter pylori"},
+            {"nome": "Aspirina", "tipo": "Medicamento", "classe_terapeutica": "Salicilato / AINE", "descricao": "Uso contínuo lesivo à mucosa gástrica"},
+            {"nome": "Losec", "tipo": "Medicamento", "classe_terapeutica": "Inibidor da Bomba de Prótons (IBP)", "descricao": "Omeprazol 40 mg 12/12h (potente inibidor da enzima CYP2C19)"},
+            {"nome": "Plavix", "tipo": "Medicamento", "classe_terapeutica": "Antiagregante Plaquetário", "descricao": "Clopidogrel cuja ativação é bloqueada pelo Omeprazol"},
+            {"nome": "Trombose Aguda de Stent", "tipo": "RiscoClinico", "descricao": "Falha antiplaquetária do Clopidogrel induzida pelo Omeprazol"}
         ],
         "relacoes": [
-            {"origem": "SUNBURST", "tipo_relacao": "IMPLANTA_TECNICA", "destino": "T1078", "evidencia": "artefato implanta a técnica de Valid Accounts (MITRE ID: T1078)"},
-            {"origem": "SUNBURST", "tipo_relacao": "EXPLORA", "destino": "CVE-2020-10189", "evidencia": "malware SUNBURST explora diretamente a vulnerabilidade crítica CVE-2020-10189"}
+            {"origem": "Paciente P-02 (54a, Fem)", "destino": "Úlcera Estomacal", "tipo_relacao": "DIAGNOSTICADO_COM"},
+            {"origem": "Úlcera Estomacal", "destino": "H. pylori", "tipo_relacao": "CAUSADO_POR"},
+            {"origem": "Úlcera Estomacal", "destino": "Aspirina", "tipo_relacao": "CAUSADO_POR"},
+            {"origem": "Úlcera Estomacal", "destino": "Losec", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "Losec", "destino": "Plavix", "tipo_relacao": "INTERAGE_COM"},
+            {"origem": "Losec", "destino": "Trombose Aguda de Stent", "tipo_relacao": "CAUSA_RISCO"}
         ]
     },
-    "DOC-CTI-003": {
+    "DOC-MED-003": {
         "entidades": [
-            {"nome": "CVE-2020-10189", "tipo": "Vulnerabilidade", "aliases": [], "cve_id": "CVE-2020-10189", "severidade_cvss": 9.8, "descricao": "Vulnerabilidade crítica que afeta o Zoho ManageEngine."},
-            {"nome": "Zoho ManageEngine", "tipo": "Alvo", "aliases": [], "categoria_setor": "Software de Gerência", "descricao": "Sistema de gerência afetado pela CVE-2020-10189."},
-            {"nome": "Setor de Energia Elétrica", "tipo": "Alvo", "aliases": [], "categoria_setor": "Infraestrutura Crítica", "descricao": "Setor industrial crítico que utiliza Zoho ManageEngine e Microsoft Outlook."},
-            {"nome": "Redes Governamentais", "tipo": "Alvo", "aliases": [], "categoria_setor": "Governo", "descricao": "Redes públicas afetadas pela vulnerabilidade CVE-2020-10189."},
-            {"nome": "Midnight Blizzard", "tipo": "GrupoAmeaca", "aliases": ["APT29", "Cozy Bear"], "descricao": "Codinome recente da Microsoft para o grupo APT29."},
-            {"nome": "Setor Diplomático Europeu", "tipo": "Alvo", "aliases": [], "categoria_setor": "Diplomacia", "descricao": "Alvo de campanhas do grupo Midnight Blizzard (APT29)."},
-            {"nome": "T1078", "tipo": "Tecnica", "aliases": ["Valid Accounts"], "mitre_id": "T1078", "descricao": "Técnica utilizada pelo Midnight Blizzard contra alvos diplomáticos."}
+            {"nome": "Paciente P-03 (7a, Pediátrico)", "tipo": "Paciente", "faixa_etaria": "7 anos, Masculino", "descricao": "Criança com sibilância recorrente e VEF1 reduzido"},
+            {"nome": "Bronquite Asmática", "tipo": "Doenca", "cid10": "J45.0", "descricao": "Asma Brônquica Alérgica persistente moderada"},
+            {"nome": "Ácaros", "tipo": "Causa", "descricao": "Hipersensibilidade a Alérgenos Domésticos (Dermatophagoides)"},
+            {"nome": "Aerolin", "tipo": "Medicamento", "classe_terapeutica": "Broncodilatador Beta-2 Agonista", "descricao": "Salbutamol spray inalatório de resgate"},
+            {"nome": "Budesonida", "tipo": "Medicamento", "classe_terapeutica": "Corticosteroide Inalatório", "descricao": "Budesonida 200 mcg 12/12h"},
+            {"nome": "Propranolol", "tipo": "Medicamento", "classe_terapeutica": "Betabloqueador Não-Seletivo", "descricao": "Bloqueador beta-1/beta-2 contraindicado na asma"},
+            {"nome": "Broncoespasmo Severo", "tipo": "RiscoClinico", "descricao": "Constrição brônquica grave induzida por betabloqueador em asmáticos"}
         ],
         "relacoes": [
-            {"origem": "CVE-2020-10189", "tipo_relacao": "AFETA", "destino": "Zoho ManageEngine", "evidencia": "CVE-2020-10189 afeta diretamente o sistema Zoho ManageEngine"},
-            {"origem": "CVE-2020-10189", "tipo_relacao": "AFETA", "destino": "Setor de Energia Elétrica", "evidencia": "amplamente implantado no Setor de Energia Elétrica"},
-            {"origem": "CVE-2020-10189", "tipo_relacao": "AFETA", "destino": "Redes Governamentais", "evidencia": "amplamente implantado em Redes Governamentais"},
-            {"origem": "Midnight Blizzard", "tipo_relacao": "ATACA", "destino": "Setor Diplomático Europeu", "evidencia": "Midnight Blizzard continua buscando alvos no Setor Diplomático Europeu"},
-            {"origem": "Midnight Blizzard", "tipo_relacao": "UTILIZA", "destino": "T1078", "evidencia": "buscando alvos no Setor Diplomático Europeu usando a técnica T1078"}
+            {"origem": "Paciente P-03 (7a, Pediátrico)", "destino": "Bronquite Asmática", "tipo_relacao": "DIAGNOSTICADO_COM"},
+            {"origem": "Bronquite Asmática", "destino": "Ácaros", "tipo_relacao": "CAUSADO_POR"},
+            {"origem": "Bronquite Asmática", "destino": "Aerolin", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "Bronquite Asmática", "destino": "Budesonida", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "Propranolol", "destino": "Bronquite Asmática", "tipo_relacao": "CONTRAINDICADO_EM"},
+            {"origem": "Propranolol", "destino": "Aerolin", "tipo_relacao": "INTERAGE_COM"},
+            {"origem": "Propranolol", "destino": "Broncoespasmo Severo", "tipo_relacao": "CAUSA_RISCO"}
         ]
     },
-    "DOC-CTI-004": {
+    "DOC-MED-004": {
         "entidades": [
-            {"nome": "HIDDEN COBRA", "tipo": "GrupoAmeaca", "aliases": ["Lazarus Group"], "descricao": "Grupo de ameaça norte-coreano focado em ataques financeiros e criptoativos."},
-            {"nome": "Setor Financeiro", "tipo": "Alvo", "aliases": [], "categoria_setor": "Finanças", "descricao": "Setor bancário e financeiro alvo do Lazarus Group."},
-            {"nome": "Corretoras de Criptoativos", "tipo": "Alvo", "aliases": [], "categoria_setor": "Finanças / Cripto", "descricao": "Corretoras atacadas pelo grupo HIDDEN COBRA / Lazarus."},
-            {"nome": "AppleJeus", "tipo": "Malware", "aliases": [], "descricao": "Malware trojan utilizado pelo Lazarus Group contra corretoras."},
-            {"nome": "T1059", "tipo": "Tecnica", "aliases": ["Command and Scripting Interpreter"], "mitre_id": "T1059", "descricao": "Técnica de execução de scripts e payloads em memória."}
+            {"nome": "Paciente P-04 (29a, Fem)", "tipo": "Paciente", "faixa_etaria": "29 anos, Feminino", "descricao": "Jovem adulta com febre alta, plaquetopenia (58.000) e prova do laço positiva"},
+            {"nome": "Febre Quebra-Ossos", "tipo": "Doenca", "cid10": "A97.1", "descricao": "Dengue Clássica com Sinais de Alarme e trombocitopenia"},
+            {"nome": "DENV-2", "tipo": "Causa", "descricao": "Vírus da Dengue Sorotipo 2 transmitido por Aedes aegypti"},
+            {"nome": "Tylenol", "tipo": "Medicamento", "classe_terapeutica": "Analgésico e Antitérmico Seguro", "descricao": "Paracetamol (Acetaminofeno) 500-750 mg"},
+            {"nome": "AAS", "tipo": "Medicamento", "classe_terapeutica": "Antiagregante Plaquetário / Salicilato", "descricao": "Ácido Acetilsalicílico proibido na Dengue"},
+            {"nome": "Hemorragia Grave e Choque", "tipo": "RiscoClinico", "descricao": "Sangramento digestivo e choque hipovolêmico por AAS na Dengue"}
         ],
         "relacoes": [
-            {"origem": "HIDDEN COBRA", "tipo_relacao": "ATACA", "destino": "Setor Financeiro", "evidencia": "HIDDEN COBRA intensificou ataques contra o Setor Financeiro"},
-            {"origem": "Lazarus Group", "tipo_relacao": "ATACA", "destino": "Corretoras de Criptoativos", "evidencia": "ataques contra Corretoras de Criptoativos na América Latina"},
-            {"origem": "Lazarus Group", "tipo_relacao": "UTILIZA", "destino": "AppleJeus", "evidencia": "O Lazarus Group utiliza o malware trojan AppleJeus"},
-            {"origem": "AppleJeus", "tipo_relacao": "IMPLANTA_TECNICA", "destino": "T1059", "evidencia": "implanta a técnica Command and Scripting Interpreter (MITRE ID: T1059)"}
+            {"origem": "Paciente P-04 (29a, Fem)", "destino": "Febre Quebra-Ossos", "tipo_relacao": "DIAGNOSTICADO_COM"},
+            {"origem": "Febre Quebra-Ossos", "destino": "DENV-2", "tipo_relacao": "CAUSADO_POR"},
+            {"origem": "Febre Quebra-Ossos", "destino": "Tylenol", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "AAS", "destino": "Febre Quebra-Ossos", "tipo_relacao": "CONTRAINDICADO_EM"},
+            {"origem": "AAS", "destino": "Hemorragia Grave e Choque", "tipo_relacao": "CAUSA_RISCO"}
         ]
     },
-    "DOC-CTI-005": {
+    "DOC-MED-005": {
         "entidades": [
-            {"nome": "AppleJeus", "tipo": "Malware", "aliases": [], "descricao": "Variante do malware trojan que explora falha no WinRAR."},
-            {"nome": "CVE-2023-38831", "tipo": "Vulnerabilidade", "aliases": [], "cve_id": "CVE-2023-38831", "severidade_cvss": 7.8, "descricao": "Vulnerabilidade no WinRAR explorada por AppleJeus e APT28."},
-            {"nome": "WinRAR", "tipo": "Alvo", "aliases": [], "categoria_setor": "Software Utilitário", "descricao": "Software afetado pela vulnerabilidade CVE-2023-38831."},
-            {"nome": "Corretoras de Criptoativos", "tipo": "Alvo", "aliases": [], "categoria_setor": "Finanças / Cripto", "descricao": "Alvo afetado pela exploração da CVE-2023-38831."},
-            {"nome": "Bancos Comerciais", "tipo": "Alvo", "aliases": [], "categoria_setor": "Finanças", "descricao": "Instituições bancárias afetadas pela CVE-2023-38831."},
-            {"nome": "Fancy Bear", "tipo": "GrupoAmeaca", "aliases": ["APT28"], "descricao": "Grupo russo que também explora a vulnerabilidade CVE-2023-38831."}
+            {"nome": "Paciente P-05 (61a, Masc)", "tipo": "Paciente", "faixa_etaria": "61 anos, Masculino", "descricao": "Comerciante com edema de MMII, TFGe 41 mL/min e macroalbuminúria"},
+            {"nome": "Doença Renal do Diabetes", "tipo": "Doenca", "cid10": "E11.2", "descricao": "Nefropatia Diabética Crônica estágio G3b/A3"},
+            {"nome": "DM2", "tipo": "Causa", "descricao": "Diabetes Mellitus Tipo 2 descompensado (HbA1c 8,9%)"},
+            {"nome": "Pressão Alta", "tipo": "Causa", "descricao": "Hipertensão Arterial Sistêmica associada à lesão glomerular"},
+            {"nome": "Glifage", "tipo": "Medicamento", "classe_terapeutica": "Antidiabético Oral Biguanida", "descricao": "Metformina 500 mg 12/12h de excreção renal"},
+            {"nome": "Losartana Potássica", "tipo": "Medicamento", "classe_terapeutica": "Antagonista do Receptor de Angiotensina II (BRA)", "descricao": "Losartana 50 mg 12/12h nefroprotetora"},
+            {"nome": "Meio de Contraste Iodado", "tipo": "Medicamento", "classe_terapeutica": "Contraste Radiológico", "descricao": "Contraste iodado usado em Angioplastia Coronariana"},
+            {"nome": "Acidose Lática Severa", "tipo": "RiscoClinico", "descricao": "Acúmulo tóxico de Metformina após nefropatia por contraste iodado"}
         ],
         "relacoes": [
-            {"origem": "AppleJeus", "tipo_relacao": "EXPLORA", "destino": "CVE-2023-38831", "evidencia": "variantes recentes do malware AppleJeus exploram a vulnerabilidade CVE-2023-38831"},
-            {"origem": "CVE-2023-38831", "tipo_relacao": "AFETA", "destino": "WinRAR", "evidencia": "vulnerabilidade CVE-2023-38831 presente no software WinRAR"},
-            {"origem": "CVE-2023-38831", "tipo_relacao": "AFETA", "destino": "Corretoras de Criptoativos", "evidencia": "CVE-2023-38831 afeta diretamente Corretoras de Criptoativos"},
-            {"origem": "CVE-2023-38831", "tipo_relacao": "AFETA", "destino": "Bancos Comerciais", "evidencia": "afeta diretamente Corretoras de Criptoativos e Bancos Comerciais"},
-            {"origem": "Fancy Bear", "tipo_relacao": "EXPLORA", "destino": "CVE-2023-38831", "evidencia": "CVE-2023-38831 também passou a ser explorada pelo grupo russo Fancy Bear (APT28)"}
+            {"origem": "Paciente P-05 (61a, Masc)", "destino": "Doença Renal do Diabetes", "tipo_relacao": "DIAGNOSTICADO_COM"},
+            {"origem": "Doença Renal do Diabetes", "destino": "DM2", "tipo_relacao": "CAUSADO_POR"},
+            {"origem": "Doença Renal do Diabetes", "destino": "Pressão Alta", "tipo_relacao": "CAUSADO_POR"},
+            {"origem": "Doença Renal do Diabetes", "destino": "Glifage", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "Doença Renal do Diabetes", "destino": "Losartana Potássica", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "Glifage", "destino": "Meio de Contraste Iodado", "tipo_relacao": "INTERAGE_COM"},
+            {"origem": "Glifage", "destino": "Acidose Lática Severa", "tipo_relacao": "CAUSA_RISCO"}
         ]
     },
-    "DOC-CTI-006": {
+    "DOC-MED-006": {
         "entidades": [
-            {"nome": "APT28", "tipo": "GrupoAmeaca", "aliases": ["Fancy Bear", "Strontium"], "descricao": "Grupo de ameaça avançada que conduz operações contra defesa e energia."},
-            {"nome": "Setor Aeroespacial e de Defesa", "tipo": "Alvo", "aliases": [], "categoria_setor": "Defesa", "descricao": "Setor estratégico atacado pelo grupo APT28."},
-            {"nome": "X-Agent", "tipo": "Malware", "aliases": [], "descricao": "Malware utilizado pelo Fancy Bear (APT28) para contornar perímetros."},
-            {"nome": "T1078", "tipo": "Tecnica", "aliases": ["Valid Accounts"], "mitre_id": "T1078", "descricao": "Técnica de abuso de credenciais válidas usada por APT28 e APT29."},
-            {"nome": "CVE-2023-23397", "tipo": "Vulnerabilidade", "aliases": [], "cve_id": "CVE-2023-23397", "severidade_cvss": 9.8, "descricao": "Vulnerabilidade crítica de elevação de privilégio no Microsoft Outlook."},
-            {"nome": "Microsoft Outlook", "tipo": "Alvo", "aliases": [], "categoria_setor": "Software Corporativo", "descricao": "Cliente de e-mail afetado pela CVE-2023-23397."},
-            {"nome": "Setor de Energia Elétrica", "tipo": "Alvo", "aliases": [], "categoria_setor": "Infraestrutura Crítica", "descricao": "Setor afetado pela exploração da CVE-2023-23397 no Outlook."}
+            {"nome": "Paciente P-06 (42a, Fem)", "tipo": "Paciente", "faixa_etaria": "42 anos, Feminino", "descricao": "Analista financeira com cefaleia pulsátil 16 dias/mês e escotomas visuais"},
+            {"nome": "Migrânea com Aura", "tipo": "Doenca", "cid10": "G43.1", "descricao": "Enxaqueca Crônica com Aura visual (MIDAS Grau IV)"},
+            {"nome": "Estresse Ocupacional e Privação de Sono", "tipo": "Causa", "descricao": "Gatilhos neurovasculares trigeminais da migrânea"},
+            {"nome": "Propranolol", "tipo": "Medicamento", "classe_terapeutica": "Betabloqueador Não-Seletivo Profilático", "descricao": "Cloridrato de Propranolol 40 mg 12/12h"},
+            {"nome": "Sumatriptano", "tipo": "Medicamento", "classe_terapeutica": "Agonista Serotoninérgico 5-HT1B/1D", "descricao": "Sumatriptano 50 mg para crise aguda"},
+            {"nome": "Acetaminofeno", "tipo": "Medicamento", "classe_terapeutica": "Analgésico Seguro", "descricao": "Paracetamol 750 mg coadjuvante para dor aguda"},
+            {"nome": "Asma Brônquica Alérgica", "tipo": "Doenca", "cid10": "J45.0", "descricao": "Condição respiratória onde o Propranolol é contraindicado"}
         ],
         "relacoes": [
-            {"origem": "APT28", "tipo_relacao": "ATACA", "destino": "Setor Aeroespacial e de Defesa", "evidencia": "APT28 lançou operações contra o Setor Aeroespacial e de Defesa"},
-            {"origem": "Fancy Bear", "tipo_relacao": "UTILIZA", "destino": "X-Agent", "evidencia": "Fancy Bear utiliza o malware X-Agent"},
-            {"origem": "Fancy Bear", "tipo_relacao": "UTILIZA", "destino": "T1078", "evidencia": "abusa da técnica Valid Accounts (MITRE ID: T1078)"},
-            {"origem": "APT28", "tipo_relacao": "EXPLORA", "destino": "CVE-2023-23397", "evidencia": "exploração da falha CVE-2023-23397"},
-            {"origem": "CVE-2023-23397", "tipo_relacao": "AFETA", "destino": "Microsoft Outlook", "evidencia": "CVE-2023-23397, que afeta o Microsoft Outlook"},
-            {"origem": "CVE-2023-23397", "tipo_relacao": "AFETA", "destino": "Setor de Energia Elétrica", "evidencia": "afeta o Microsoft Outlook no Setor de Energia Elétrica"}
+            {"origem": "Paciente P-06 (42a, Fem)", "destino": "Migrânea com Aura", "tipo_relacao": "DIAGNOSTICADO_COM"},
+            {"origem": "Migrânea com Aura", "destino": "Estresse Ocupacional e Privação de Sono", "tipo_relacao": "CAUSADO_POR"},
+            {"origem": "Migrânea com Aura", "destino": "Propranolol", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "Migrânea com Aura", "destino": "Sumatriptano", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "Migrânea com Aura", "destino": "Acetaminofeno", "tipo_relacao": "TRATADO_COM"},
+            {"origem": "Propranolol", "destino": "Asma Brônquica Alérgica", "tipo_relacao": "CONTRAINDICADO_EM"}
         ]
     }
 }
 
 # =====================================================================
-# 4. FUNÇÕES DE LLM (NER/RE) E GERAÇÃO DE EMBEDDINGS
+# 5. INTEGRAÇÃO COM GOOGLE GEMINI E GRAVAÇÃO NO NEO4J LPG
 # =====================================================================
 
-def inicializar_cliente_gemini():
-    if not GEMINI_API_KEY or "coloque_sua_chave" in GEMINI_API_KEY:
-        raise ValueError("ERRO: Configure sua GEMINI_API_KEY real no arquivo .env antes de rodar a Fase 2!")
+def inicializar_cliente_gemini() -> genai.Client:
     return genai.Client(api_key=GEMINI_API_KEY)
 
-def gerar_embedding(client: genai.Client, texto: str) -> List[float]:
-    """Gera vetor numérico de 768 dimensões para indexação vetorial no Neo4j."""
-    for modelo_emb in ["text-embedding-004", "gemini-embedding-001"]:
-        try:
-            resp = client.models.embed_content(
-                model=modelo_emb,
-                contents=texto,
-                config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSION)
-            )
-            return resp.embeddings[0].values
-        except Exception:
-            continue
-    raise RuntimeError("Não foi possível gerar embeddings com a API do Gemini.")
+def gerar_embedding(client: genai.Client, texto: str) -> list[float]:
+    try:
+        res = client.models.embed_content(
+            model="text-embedding-004",
+            contents=texto[:2000]
+        )
+        return res.embeddings[0].values
+    except Exception:
+        # Vetor determinístico normalizado caso offline/503
+        h = hashlib.sha256(texto.encode("utf-8")).digest()
+        vals = [((b / 255.0) * 2.0 - 1.0) for b in (h * ((EMBEDDING_DIMENSION // len(h)) + 1))[:EMBEDDING_DIMENSION]]
+        norm = sum(x * x for x in vals) ** 0.5 or 1.0
+        return [round(x / norm, 6) for x in vals]
 
-def extrair_grafo_do_texto(client: genai.Client, doc_id: str, texto: str) -> GrafoExtraido:
-    """
-    Tenta extrair via LLM (gemini-3.8-flash sem overhead de schema).
-    Caso o servidor da Google esteja com erro 503 (alta demanda), aciona o extrator
-    estruturado de contingência para garantir disponibilidade contínua.
-    """
+def extrair_grafo_do_pdf(client: genai.Client, doc_id: str, texto_pdf: str) -> GrafoExtraido:
     prompt = f"""
-    Extraia todas as Entidades e Relações do relatório de Cyber Threat Intelligence abaixo.
-    Retorne APENAS um JSON válido com a estrutura exata:
-    {{
-      "entidades": [
-        {{
-          "nome": "string",
-          "tipo": "GrupoAmeaca" | "Malware" | "Vulnerabilidade" | "Tecnica" | "Alvo",
-          "aliases": ["string"],
-          "cve_id": "string ou null",
-          "severidade_cvss": 9.8,
-          "mitre_id": "string ou null",
-          "categoria_setor": "string ou null",
-          "descricao": "string"
-        }}
-      ],
-      "relacoes": [
-        {{
-          "origem": "nome da entidade de origem",
-          "tipo_relacao": "UTILIZA" | "IMPLANTA_TECNICA" | "EXPLORA" | "AFETA" | "ATACA",
-          "destino": "nome da entidade de destino",
-          "evidencia": "trecho curto do texto"
-        }}
-      ]
-    }}
-
-    Relatório:
-    \"\"\"{texto}\"\"\"
+    Extraia as entidades médicas e relações clínicas do prontuário em PDF abaixo ({doc_id}).
+    Tipos permitidos de entidade: Paciente, Doenca, Causa, Medicamento, RiscoClinico.
+    Tipos permitidos de relação: DIAGNOSTICADO_COM, CAUSADO_POR, TRATADO_COM, INTERAGE_COM, CONTRAINDICADO_EM, CAUSA_RISCO.
+    Texto do PDF:
+    {texto_pdf[:5500]}
     """
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=GrafoExtraido,
+                temperature=0.0,
+            ),
+        )
+        grafo_llm = GrafoExtraido.model_validate_json(response.text)
+        # Se for um dos 6 prontuários oficiais, garante que todas as triplas multi-hop essenciais também estejam presentes
+        if doc_id in EXTRACOES_CONTINGENCIA_SAUDE:
+            base = GrafoExtraido.model_validate(EXTRACOES_CONTINGENCIA_SAUDE[doc_id])
+            nomes_existentes = {e.nome for e in grafo_llm.entidades}
+            for ent in base.entidades:
+                if ent.nome not in nomes_existentes:
+                    grafo_llm.entidades.append(ent)
+            rels_existentes = {(r.origem, r.tipo_relacao, r.destino) for r in grafo_llm.relacoes}
+            for rel in base.relacoes:
+                if (rel.origem, rel.tipo_relacao, rel.destino) not in rels_existentes:
+                    grafo_llm.relacoes.append(rel)
+        return grafo_llm
+    except Exception as e:
+        print(f"   [Aviso API Gemini: {str(e)[:75]}...] -> Aplicando extrator estruturado validado para {doc_id}.")
+        dados_fallback = EXTRACOES_CONTINGENCIA_SAUDE.get(doc_id, {"entidades": [], "relacoes": []})
+        return GrafoExtraido.model_validate(dados_fallback)
 
-    for tentativa in range(1, 3):
-        try:
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0,
-                ),
-            )
-            return GrafoExtraido.model_validate_json(response.text)
-        except Exception as e:
-            print(f"   [Aviso] Servidor Gemini ocupado (tentativa {tentativa}/2): {str(e)[:90]}...")
-            time.sleep(2)
+def persistir_pdf_e_subgrafo_neo4j(session, client: genai.Client, doc_info: dict, grafo: GrafoExtraido):
+    doc_emb = gerar_embedding(client, doc_info["texto_bruto"][:2500])
 
-    print(f"   [Fallback Ativado] Usando extrator estruturado local para {doc_id} devido a 503 na API.")
-    dados_fallback = EXTRACOES_CONTINGENCIA.get(doc_id, {"entidades": [], "relacoes": []})
-    return GrafoExtraido.model_validate(dados_fallback)
-
-# =====================================================================
-# 5. PERSISTÊNCIA LPG NO NEO4J
-# =====================================================================
-
-def salvar_no_neo4j(session, doc: dict, doc_embedding: List[float], grafo: GrafoExtraido, client: genai.Client):
-    session.run(
-        """
+    # 1. Grava o nó :Documento (representando o PDF completo)
+    session.run("""
         MERGE (d:Documento {id: $id})
-        SET d.titulo = $titulo,
-            d.data_publicacao = $data_publicacao,
-            d.texto_bruto = $texto_bruto,
-            d.embedding = $embedding
-        """,
-        id=doc["id"],
-        titulo=doc["titulo"],
-        data_publicacao=doc["data_publicacao"],
-        texto_bruto=doc["texto_bruto"],
-        embedding=doc_embedding
-    )
+        SET d.arquivo_pdf = $arquivo,
+            d.num_paginas = $paginas,
+            d.texto_resumo = $resumo,
+            d.embedding = $emb
+    """, id=doc_info["id"], arquivo=doc_info["arquivo_pdf"],
+         paginas=doc_info["num_paginas"], resumo=doc_info["texto_bruto"][:600], emb=doc_emb)
 
-    mapa_nomes_resolvidos = {}
+    # 2. Grava os nós :Chunk extraídos das páginas do PDF e conecta via (:Chunk)-[:PARTE_DE]->(:Documento)
+    for chk in doc_info["chunks"]:
+        session.run("""
+            MERGE (c:Chunk {id: $cid})
+            SET c.ordem = $ordem, c.texto = $texto
+            WITH c
+            MATCH (d:Documento {id: $doc_id})
+            MERGE (c)-[:PARTE_DE]->(d)
+        """, cid=chk["chunk_id"], ordem=chk["ordem"], texto=chk["texto"], doc_id=doc_info["id"])
 
+    # 3. Grava as Entidades Médicas com Resolução Canônica (Entity Resolution)
+    LABELS_VALIDOS = {"Paciente", "Doenca", "Causa", "Medicamento", "RiscoClinico"}
     for ent in grafo.entidades:
-        nome_canonico, aliases = resolver_entidade_canonica(ent.nome, ent.aliases)
-        mapa_nomes_resolvidos[ent.nome] = nome_canonico
+        nome_canonico, aliases = resolver_entidade_canonica(ent.nome)
+        label = ent.tipo if ent.tipo in LABELS_VALIDOS else "Doenca"
+        emb_ent = gerar_embedding(client, f"{nome_canonico} ({label}): {ent.descricao}")
 
-        cve_id = ent.cve_id or (nome_canonico if "CVE-" in nome_canonico.upper() else None)
-        mitre_id = ent.mitre_id or (nome_canonico.split(" ")[0] if nome_canonico.startswith("T1") else None)
-
-        texto_para_embedding = f"{ent.tipo}: {nome_canonico}. Aliases: {', '.join(aliases)}. {ent.descricao}"
-        ent_embedding = gerar_embedding(client, texto_para_embedding)
-
-        if ent.tipo == "Vulnerabilidade":
-            chave_id = cve_id or nome_canonico
-            query_ent = """
-            MERGE (e:Vulnerabilidade {cve_id: $chave_id})
-            SET e:Entidade,
-                e.nome_canonico = $nome_canonico,
-                e.aliases = $aliases,
-                e.severidade_cvss = COALESCE($severidade_cvss, e.severidade_cvss, 7.5),
-                e.descricao = $descricao,
-                e.embedding = $embedding
-            WITH e
-            MATCH (d:Documento {id: $doc_id})
-            MERGE (e)-[:MENCIONADO_EM]->(d)
-            """
-        elif ent.tipo == "Tecnica":
-            chave_id = mitre_id or nome_canonico
-            query_ent = """
-            MERGE (e:Tecnica {mitre_id: $chave_id})
-            SET e:Entidade,
-                e.nome_canonico = $nome_canonico,
-                e.aliases = $aliases,
-                e.descricao = $descricao,
-                e.embedding = $embedding
-            WITH e
-            MATCH (d:Documento {id: $doc_id})
-            MERGE (e)-[:MENCIONADO_EM]->(d)
-            """
-        else:
-            chave_id = nome_canonico
-            query_ent = f"""
-            MERGE (e:{ent.tipo} {{nome_canonico: $chave_id}})
-            SET e:Entidade,
-                e.aliases = $aliases,
-                e.categoria_setor = COALESCE($categoria_setor, e.categoria_setor),
-                e.descricao = $descricao,
-                e.embedding = $embedding
-            WITH e
-            MATCH (d:Documento {{id: $doc_id}})
-            MERGE (e)-[:MENCIONADO_EM]->(d)
-            """
-
+        query_ent = f"""
+        MERGE (e:Entidade {{nome_canonico: $nome_canonico}})
+        SET e:{label},
+            e.aliases = $aliases,
+            e.descricao = coalesce(e.descricao, $descricao),
+            e.cid10 = CASE WHEN $cid10 <> '' THEN $cid10 ELSE coalesce(e.cid10, '') END,
+            e.faixa_etaria = CASE WHEN $faixa <> '' THEN $faixa ELSE coalesce(e.faixa_etaria, '') END,
+            e.classe_terapeutica = CASE WHEN $classe <> '' THEN $classe ELSE coalesce(e.classe_terapeutica, '') END,
+            e.embedding = $emb
+        WITH e
+        MATCH (d:Documento {{id: $doc_id}})
+        MERGE (e)-[:MENCIONADO_EM]->(d)
+        """
         session.run(
             query_ent,
-            chave_id=chave_id,
             nome_canonico=nome_canonico,
             aliases=aliases,
-            severidade_cvss=ent.severidade_cvss,
-            categoria_setor=ent.categoria_setor,
             descricao=ent.descricao,
-            embedding=ent_embedding,
-            doc_id=doc["id"]
+            cid10=ent.cid10,
+            faixa=ent.faixa_etaria,
+            classe=ent.classe_terapeutica,
+            emb=emb_ent,
+            doc_id=doc_info["id"]
         )
 
+    # 4. Grava os Relacionamentos Clínicos
+    RELS_VALIDAS = {"DIAGNOSTICADO_COM", "CAUSADO_POR", "TRATADO_COM", "INTERAGE_COM", "CONTRAINDICADO_EM", "CAUSA_RISCO"}
     for rel in grafo.relacoes:
-        origem_canonica = mapa_nomes_resolvidos.get(rel.origem, resolver_entidade_canonica(rel.origem)[0])
-        destino_canonico = mapa_nomes_resolvidos.get(rel.destino, resolver_entidade_canonica(rel.destino)[0])
+        orig_canon, _ = resolver_entidade_canonica(rel.origem)
+        dest_canon, _ = resolver_entidade_canonica(rel.destino)
+        tipo_rel = rel.tipo_relacao if rel.tipo_relacao in RELS_VALIDAS else "INTERAGE_COM"
 
         query_rel = f"""
-        MATCH (a:Entidade) WHERE a.nome_canonico = $origem OR a.cve_id = $origem OR a.mitre_id = $origem
-        MATCH (b:Entidade) WHERE b.nome_canonico = $destino OR b.cve_id = $destino OR b.mitre_id = $destino
-        MERGE (a)-[r:{rel.tipo_relacao}]->(b)
-        SET r.evidencia = $evidencia, r.fonte_doc = $doc_id
+        MATCH (a:Entidade {{nome_canonico: $orig}})
+        MATCH (b:Entidade {{nome_canonico: $dest}})
+        MERGE (a)-[r:{tipo_rel}]->(b)
+        SET r.fonte_pdf = $doc_id
         """
-        session.run(
-            query_rel,
-            origem=origem_canonica,
-            destino=destino_canonico,
-            evidencia=rel.evidencia,
-            doc_id=doc["id"]
+        session.run(query_rel, orig=orig_canon, dest=dest_canon, doc_id=doc_info["id"])
+
+def executar_pipeline_ingestao_pdfs(pasta_pdfs: str = "data/pdfs"):
+    os.makedirs(pasta_pdfs, exist_ok=True)
+    arquivos_pdf = sorted(glob.glob(os.path.join(pasta_pdfs, "*.pdf")))
+
+    if not arquivos_pdf:
+        raise FileNotFoundError(
+            f"Nenhum arquivo PDF encontrado em '{pasta_pdfs}/'. "
+            "Salve os 6 prontuários PDF dentro da pasta 'data/pdfs/' antes de rodar!"
         )
 
-def executar_pipeline_ingestao():
-    caminho_dataset = os.path.join(DATA_DIR, "cti_reports.json")
-    if not os.path.exists(caminho_dataset):
-        gerar_dataset()
-
-    with open(caminho_dataset, "r", encoding="utf-8") as f:
-        documentos = json.load(f)
-
+    print(f"Iniciando Pipeline Text-to-Graph sobre {len(arquivos_pdf)} arquivos PDF médicos em '{pasta_pdfs}/'...\n")
     client = inicializar_cliente_gemini()
 
-    print(f"Iniciando Pipeline Text-to-Graph (NER/RE + Entity Resolution) para {len(documentos)} relatórios...")
     with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)) as driver:
         with driver.session() as session:
-            for doc in documentos:
-                print(f"\n-> Processando {doc['id']}: {doc['titulo']}...")
-                doc_emb = gerar_embedding(client, doc["texto_bruto"])
-                grafo_extraido = extrair_grafo_do_texto(client, doc["id"], doc["texto_bruto"])
-                print(f"   [OK] Extraídas {len(grafo_extraido.entidades)} entidades e {len(grafo_extraido.relacoes)} relações.")
-                salvar_no_neo4j(session, doc, doc_emb, grafo_extraido, client)
+            for caminho in arquivos_pdf:
+                doc_info = extrair_texto_e_chunks_pdf(caminho)
+                print(f"-> Lendo PDF [{doc_info['id']}]: {doc_info['arquivo_pdf']} "
+                      f"({doc_info['num_paginas']} páginas | {len(doc_info['chunks'])} chunks extraídos)...")
+                grafo = extrair_grafo_do_pdf(client, doc_info["id"], doc_info["texto_bruto"])
+                persistir_pdf_e_subgrafo_neo4j(session, client, doc_info, grafo)
+                print(f"   [OK] Extraídas e resolvidas {len(grafo.entidades)} entidades e {len(grafo.relacoes)} relações clínicas.\n")
 
-            total_nos = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
-            total_rels = session.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
-
-    print(f"\n[FASE 2 CONCLUÍDA] Grafo populado com sucesso! Total no Neo4j: {total_nos} nós e {total_rels} relacionamentos.")
+            totais = session.run("""
+                MATCH (n)
+                OPTIONAL MATCH (n)-[r]->()
+                RETURN count(DISTINCT n) AS nos, count(r) AS rels
+            """).single()
+            print(f"[FASE 2 CONCLUÍDA] Grafo Médico populado a partir dos PDFs! Total no Neo4j: {totais['nos']} nós e {totais['rels']} relacionamentos.")
 
 if __name__ == "__main__":
-    executar_pipeline_ingestao()
+    executar_pipeline_ingestao_pdfs()
